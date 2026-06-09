@@ -4,7 +4,7 @@ A pairs trading system built on NSE (Indian) stocks that automatically detects
 cointegrated pairs, generates z-score based trading signals, and backtests
 the strategy on out-of-sample data.
 
-Live Demo : https://your-app-link.streamlit.app  ← update this after deployment
+Live Demo : https://stat-arb-detector-gzwbjuusnrvrehdnzr3f5m.streamlit.app
 
 ---
 
