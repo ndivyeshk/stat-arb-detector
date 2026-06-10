@@ -127,47 +127,119 @@ def run_backtest(pair_data, stock_a, stock_b):
 
     return summary, trades_df
 
+def run_lstm_backtest(prices, train, test, stock_a, stock_b):
+    """
+    Runs backtest using LSTM predicted z-scores instead of raw z-scores.
+    
+    1. Gets z-score on train period → trains LSTM
+    2. Predicts z-scores on full period
+    3. Uses predicted z-scores to generate signals
+    4. Backtests those signals on test period only
+    """
+    from src.lstm_model import train_lstm, predict_zscore
+    from src.signals import get_pair_data, calculate_hedge_ratio, calculate_spread, generate_signals
+    
+    # get z-scores for train and full period
+    train_data, hedge_ratio = get_pair_data(train, stock_a, stock_b)
+    full_data,  _           = get_pair_data(prices, stock_a, stock_b)
+
+    zscore_train = train_data["zscore"].dropna()
+    zscore_full  = full_data["zscore"].dropna()
+
+    # train LSTM on train period z-scores
+    print(f"  Training LSTM for {stock_a} & {stock_b}...")
+    model = train_lstm(zscore_train, epochs=50)
+
+    # predict z-scores on full period
+    predicted_zscore = predict_zscore(model, zscore_full)
+
+    # get test period prices
+    test_data, _ = get_pair_data(test, stock_a, stock_b)
+
+    # align predicted z-scores to test period only
+    predicted_test = predicted_zscore[predicted_zscore.index.isin(test_data.index)]
+
+    if len(predicted_test) == 0:
+        return None, None
+
+    # build pair_data using predicted z-scores
+    lstm_pair_data = test_data.copy()
+    lstm_pair_data["zscore"] = predicted_test
+
+    # generate signals from predicted z-scores
+    lstm_pair_data["signal"] = generate_signals(lstm_pair_data["zscore"])
+
+    # run backtest
+    summary, trades = run_backtest(lstm_pair_data, stock_a, stock_b)
+    return summary, trades
 
 if __name__ == "__main__":
     from data_loader import load_prices, split_prices
     from cointegration import find_cointegrated_pairs
     from signals import get_pair_data
 
-    prices = load_prices()
-
-    # split into train and test
+    prices      = load_prices()
     train, test = split_prices(prices)
 
-    # find cointegrated pairs on TRAIN data only
     print("\nFinding pairs on train data...")
     pairs = find_cointegrated_pairs(train)
 
-    print(f"\nBacktesting all {len(pairs)} pairs on test data...\n")
+    print(f"\nRunning Raw + LSTM backtest on all {len(pairs)} pairs...\n")
 
-    all_summaries = []
+    all_raw_summaries  = []
+    all_lstm_summaries = []
 
     for i in range(len(pairs)):
         row     = pairs.iloc[i]
         stock_a = row["stock_a"]
         stock_b = row["stock_b"]
 
-        pair_data, _ = get_pair_data(test, stock_a, stock_b)
-        summary, trades = run_backtest(pair_data, stock_a, stock_b)
+        # raw backtest
+        pair_data, _   = get_pair_data(test, stock_a, stock_b)
+        raw_summary, _ = run_backtest(pair_data, stock_a, stock_b)
 
-        if summary:
-            all_summaries.append(summary)
+        # lstm backtest
+        lstm_summary, _ = run_lstm_backtest(prices, train, test, stock_a, stock_b)
 
-    # convert to DataFrame and sort by total return
-    results_df = pd.DataFrame(all_summaries)
-    results_df = results_df.sort_values("total_return_pct", ascending=False).reset_index(drop=True)
+        if raw_summary:
+            raw_summary["pair"] = f"{stock_a} / {stock_b}"
+            all_raw_summaries.append(raw_summary)
 
-    # filter only profitable pairs
-    profitable = results_df[results_df["total_return_pct"] > 0]
+        if lstm_summary:
+            lstm_summary["pair"] = f"{stock_a} / {stock_b}"
+            all_lstm_summaries.append(lstm_summary)
 
-    print(f"Results across all pairs:")
-    print(f"Total pairs tested    : {len(results_df)}")
-    print(f"Profitable pairs      : {len(profitable)}")
-    print(f"Loss making pairs     : {len(results_df) - len(profitable)}")
+    # build DataFrames
+    raw_df  = pd.DataFrame(all_raw_summaries)
+    lstm_df = pd.DataFrame(all_lstm_summaries)
 
-    print(f"\n--- Top 10 profitable pairs ---\n")
-    print(profitable.head(10).to_string(index=False))
+    # merge on pair for comparison
+    merged = raw_df.merge(lstm_df, on="pair", suffixes=("_raw", "_lstm"))
+
+    # find pairs where LSTM improved total return
+    merged["lstm_improved"] = merged["total_return_pct_lstm"] > merged["total_return_pct_raw"]
+
+    improved     = merged[merged["lstm_improved"] == True]
+    not_improved = merged[merged["lstm_improved"] == False]
+
+    print(f"\n{'='*50}")
+    print(f"RESULTS ACROSS ALL {len(merged)} PAIRS")
+    print(f"{'='*50}")
+    print(f"LSTM improved return   : {len(improved)} pairs ({round(len(improved)/len(merged)*100, 1)}%)")
+    print(f"LSTM did not improve   : {len(not_improved)} pairs ({round(len(not_improved)/len(merged)*100, 1)}%)")
+
+    print(f"\n--- Top 10 pairs where LSTM helped most ---\n")
+    improved_sorted = improved.copy()
+    improved_sorted["improvement"] = improved_sorted["total_return_pct_lstm"] - improved_sorted["total_return_pct_raw"]
+    improved_sorted = improved_sorted.sort_values("improvement", ascending=False)
+
+    cols = ["pair", "total_return_pct_raw", "total_return_pct_lstm", "improvement", "hit_rate_pct_lstm", "sharpe_ratio_lstm"]
+    print(improved_sorted[cols].head(10).to_string(index=False))
+
+    print(f"\n--- Overall performance comparison ---\n")
+    print(f"  {'Metric':<30} {'Raw':>10} {'LSTM':>10}")
+    print(f"  {'-'*50}")
+    print(f"  {'Avg total return %':<30} {round(raw_df['total_return_pct'].mean(), 3):>10} {round(lstm_df['total_return_pct'].mean(), 3):>10}")
+    print(f"  {'Avg hit rate %':<30} {round(raw_df['hit_rate_pct'].mean(), 3):>10} {round(lstm_df['hit_rate_pct'].mean(), 3):>10}")
+    print(f"  {'Avg sharpe ratio':<30} {round(raw_df['sharpe_ratio'].mean(), 3):>10} {round(lstm_df['sharpe_ratio'].mean(), 3):>10}")
+    print(f"  {'Profitable pairs':<30} {len(raw_df[raw_df['total_return_pct'] > 0]):>10} {len(lstm_df[lstm_df['total_return_pct'] > 0]):>10}")
